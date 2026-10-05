@@ -324,17 +324,13 @@ async def run_scout_for_index(index_id: str, theme: str, db, macro: dict = None)
         # Monta lista de mudanças no formato esperado pelo admin console
         proposal_changes = []
         for inc in inclusions:
-            # Busca peso alvo do candidato na lista com rationale
-            target_w = next(
-                (c.get("target_weight") or c.get("ssi_weight", 0)
-                 for c in candidates_with_rationale if c.get("symbol") == inc["symbol"]),
-                0,
-            )
+            # target_weight é injetado por _compute_changes após normalização SSI com cap
+            target_w = inc.get("target_weight", 0)
             proposal_changes.append({
                 "action": "add",
                 "symbol": inc["symbol"],
                 "name": inc.get("name", inc["symbol"]),
-                "target_weight": round(float(target_w), 2),
+                "target_weight": round(float(target_w), 1),
                 "rationale": inc.get("rationale", ""),
             })
         for exc in exclusions:
@@ -636,10 +632,16 @@ def _compute_changes(
 
     # Exclusões: tokens atuais que saíram do top N
     # Tokens âncora (permanentes + campo is_anchor) são IMUNES ao Scout.
+    # REGRA: só recomendar exclusão de tokens efetivamente na cesta (in_basket=True e weight>0).
+    # Candidatos históricos com in_basket=False / weight=0 existem no DB mas não estão na cesta —
+    # incluí-los nas exclusões gera propostas sem efeito real e confunde a análise do admin.
     all_anchors = anchor_symbols | PERMANENT_ANCHORS
     tokens_to_remove = [
         sym for sym in current_symbol_set
-        if sym not in top_n_symbols and sym not in all_anchors
+        if sym not in top_n_symbols
+        and sym not in all_anchors
+        and getattr(current_symbols.get(sym), "in_basket", False)
+        and (current_symbols.get(sym).weight or 0) > 0
     ]
     protected = [sym for sym in current_symbol_set if sym not in top_n_symbols and sym in all_anchors]
     if protected:
@@ -720,6 +722,10 @@ def _compute_changes(
                 "old_weight": current.weight,
                 "new_weight": new_w,
             })
+
+    # Preenche target_weight nas inclusões usando o peso SSI calculado (com cap)
+    for inc in inclusions:
+        inc["target_weight"] = round(raw_weights.get(inc["symbol"], 0.0), 1)
 
     return inclusions, exclusions, weight_changes
 
