@@ -234,6 +234,7 @@ export default function AdminPage() {
   const [loading, setLoading] = useState(false);
   const [loadingPortfolio, setLoadingPortfolio] = useState(false);
   const [loadingTrades, setLoadingTrades] = useState(false);
+  const [tradeSourceFilter, setTradeSourceFilter] = useState<"all" | "deposit" | "rebalance" | "withdrawal">("all");
   const [feesSummary, setFeesSummary] = useState<any>(null);
   const [feesLoading, setFeesLoading] = useState(false);
   const [loadingFundWallet, setLoadingFundWallet] = useState(false);
@@ -244,6 +245,7 @@ export default function AdminPage() {
   const [actionId, setActionId] = useState<number | null>(null);
   const [executingId, setExecutingId] = useState<number | null>(null);
   const [executeResult, setExecuteResult] = useState<Record<number, string>>({});
+  const [dryRunOrders, setDryRunOrders] = useState<Record<number, {symbol:string,side:string,quantity:string,price:string,usd_value:number}[]>>({});
   const [expanded, setExpanded] = useState<number | null>(null);
   const [expandedMovement, setExpandedMovement] = useState<string | null>(null);
   const [copiedAddr, setCopiedAddr] = useState(false);
@@ -512,7 +514,10 @@ export default function AdminPage() {
     setExecuteResult(prev => ({ ...prev, [id]: "" }));
     try {
       const res = await adminApi.executeProposal(id, session.address, session.message, session.signature, dryRun);
-      setExecuteResult(prev => ({ ...prev, [id]: dryRun ? `Dry run: ${res.orders_count ?? 0} orders simulated` : `Executed: ${res.orders_count ?? 0} orders placed` }));
+      setExecuteResult(prev => ({ ...prev, [id]: dryRun ? `Dry run: ${res.orders_count ?? 0} ordens simuladas` : `Executado: ${res.orders_count ?? 0} ordens enviadas` }));
+      if (dryRun && res.execution_orders) {
+        setDryRunOrders(prev => ({ ...prev, [id]: res.execution_orders }));
+      }
       await loadAll(networkMode);
     } catch (e: unknown) {
       const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? "Execution failed";
@@ -977,9 +982,37 @@ export default function AdminPage() {
                             </div>
                             <p className="text-sm text-white/60 leading-relaxed">{p.ai_rationale}</p>
                             {executeResult[p.id] && (
-                              <p className={`text-xs mt-2 ${executeResult[p.id].startsWith("Error") ? "text-red-400" : "text-green-400"}`}>
-                                {executeResult[p.id]}
-                              </p>
+                              <div className="mt-3 space-y-2">
+                                <p className={`text-xs font-medium ${executeResult[p.id].startsWith("Error") ? "text-red-400" : "text-green-400"}`}>
+                                  {executeResult[p.id]}
+                                </p>
+                                {dryRunOrders[p.id] && dryRunOrders[p.id].length > 0 && (
+                                  <div className="rounded-lg border border-white/10 overflow-hidden">
+                                    <table className="w-full text-xs">
+                                      <thead>
+                                        <tr className="bg-white/5 text-white/40">
+                                          <th className="text-left px-3 py-2">Token</th>
+                                          <th className="text-left px-3 py-2">Lado</th>
+                                          <th className="text-right px-3 py-2">Qtd</th>
+                                          <th className="text-right px-3 py-2">Preco</th>
+                                          <th className="text-right px-3 py-2">Valor USD</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody>
+                                        {dryRunOrders[p.id].map((o, i) => (
+                                          <tr key={i} className="border-t border-white/5">
+                                            <td className="px-3 py-2 font-mono text-white/80">{o.symbol}</td>
+                                            <td className={`px-3 py-2 font-medium ${o.side === "SELL" ? "text-red-400" : "text-green-400"}`}>{o.side}</td>
+                                            <td className="px-3 py-2 text-right text-white/60">{o.quantity}</td>
+                                            <td className="px-3 py-2 text-right text-white/60">${Number(o.price).toFixed(4)}</td>
+                                            <td className="px-3 py-2 text-right text-white/80 font-medium">${Number(o.usd_value).toFixed(2)}</td>
+                                          </tr>
+                                        ))}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                )}
+                              </div>
                             )}
                             {p.changes && p.changes.length > 0 && (
                               <div className="mt-3">
@@ -1538,16 +1571,31 @@ export default function AdminPage() {
           {/* ══════════════════════ TRADES ════════════════════════════════ */}
           {activeTab === "trades" && (
             <>
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between flex-wrap gap-2">
                 <h2 className="font-semibold text-white flex items-center gap-2 text-sm">
                   <ArrowRightLeft size={14} className="text-brand-blue" /> {t("admin_trades_sodex_title")}
                   <span className={`text-xs px-2 py-0.5 rounded font-mono ${networkMode === "testnet" ? "bg-amber-500/20 text-amber-400" : "bg-blue-500/20 text-blue-400"}`}>
                     {networkMode === "testnet" ? "testnet-gw" : "mainnet-gw"}
                   </span>
                 </h2>
-                <button onClick={() => { setLoadingTrades(true); setTrades([]); adminApi.getTrades(session.address, session.message, session.signature, 50, networkMode).then(d => { setTrades(Array.isArray(d) ? d : []); setLoadingTrades(false); }).catch(() => setLoadingTrades(false)); }} className="text-white/30 hover:text-white transition-colors">
-                  <RefreshCw size={13} className={loadingTrades ? "animate-spin" : ""} />
-                </button>
+                <div className="flex items-center gap-2">
+                  {(["all", "deposit", "rebalance", "withdrawal"] as const).map(src => (
+                    <button key={src} onClick={() => setTradeSourceFilter(src)}
+                      className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                        tradeSourceFilter === src
+                          ? src === "all" ? "bg-white/10 border-white/20 text-white"
+                            : src === "deposit" ? "bg-blue-500/20 border-blue-500/40 text-blue-300"
+                            : src === "rebalance" ? "bg-orange-500/20 border-orange-500/40 text-orange-300"
+                            : "bg-red-500/20 border-red-500/40 text-red-300"
+                          : "border-white/10 text-white/30 hover:text-white/50"
+                      }`}>
+                      {src === "all" ? "Todos" : src === "deposit" ? "Dep\u00f3sito" : src === "rebalance" ? "Rebalance" : "Saque"}
+                    </button>
+                  ))}
+                  <button onClick={() => { setLoadingTrades(true); setTrades([]); adminApi.getTrades(session.address, session.message, session.signature, 50, networkMode).then(d => { setTrades(Array.isArray(d) ? d : []); setLoadingTrades(false); }).catch(() => setLoadingTrades(false)); }} className="text-white/30 hover:text-white transition-colors">
+                    <RefreshCw size={13} className={loadingTrades ? "animate-spin" : ""} />
+                  </button>
+                </div>
               </div>
               {loadingTrades && trades.length === 0 && <p className="text-white/30 text-sm text-center py-6">{t("admin_loading")}</p>}
               {!loadingTrades && trades.length === 0 && (
@@ -1556,12 +1604,15 @@ export default function AdminPage() {
                   <p className="text-white/20 text-xs mt-1">{t("admin_no_trades_sub2")}</p>
                 </div>
               )}
-              {trades.length > 0 && (
+              {(() => {
+                const filteredTrades = tradeSourceFilter === "all" ? trades : trades.filter(tr => (tr.source ?? "deposit") === tradeSourceFilter);
+                return filteredTrades.length > 0 ? (
                 <div className="card overflow-x-auto">
                   <table className="w-full text-xs">
                     <thead>
                       <tr className="text-white/20 border-b border-white/5">
-                        <th className="text-left pb-2 font-normal pr-4">{t("admin_investor_col")}</th>
+                        <th className="text-left pb-2 font-normal pr-3">{t("admin_investor_col")}</th>
+                        <th className="text-left pb-2 font-normal pr-3">Fonte</th>
                         <th className="text-left pb-2 font-normal">{t("admin_trade_symbol")}</th>
                         <th className="text-left pb-2 font-normal">{t("admin_trade_side")}</th>
                         <th className="text-right pb-2 font-normal">{t("admin_trade_qty")}</th>
@@ -1572,19 +1623,32 @@ export default function AdminPage() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-white/3">
-                      {trades.map((tr, i) => {
+                      {filteredTrades.map((tr, i) => {
                         const wallet = String(tr.investor_wallet ?? "");
                         const shortWallet = wallet.length >= 10 ? `${wallet.slice(0, 6)}…${wallet.slice(-4)}` : wallet;
                         const isFounder = wallet.toLowerCase() === "0x1a3ade798b60bd6e99ff3d84367cc7913115031c";
                         return (
                           <tr key={tr.id ?? i}>
-                            <td className="py-2 pr-4">
-                              <div className="flex items-center gap-1.5" title={wallet || undefined}>
-                                <span className="font-mono text-white/50 cursor-default">{shortWallet || "—"}</span>
-                                {isFounder && (
-                                  <span className="text-xs px-1 py-0.5 rounded border font-medium text-purple-300 bg-purple-500/10 border-purple-500/20">Founder</span>
-                                )}
-                              </div>
+                            <td className="py-2 pr-3">
+                              {(tr.source ?? "deposit") === "rebalance" || (tr.source ?? "deposit") === "withdrawal" ? (
+                                <span className="text-white/20 text-xs italic">Pool</span>
+                              ) : (
+                                <div className="flex items-center gap-1.5" title={wallet || undefined}>
+                                  <span className="font-mono text-white/50 cursor-default">{shortWallet || "—"}</span>
+                                  {isFounder && (
+                                    <span className="text-xs px-1 py-0.5 rounded border font-medium text-purple-300 bg-purple-500/10 border-purple-500/20">Founder</span>
+                                  )}
+                                </div>
+                              )}
+                            </td>
+                            <td className="py-2 pr-3">
+                              {(tr.source ?? "deposit") === "rebalance" ? (
+                                <span className="text-xs px-1.5 py-0.5 rounded bg-orange-500/15 text-orange-300 border border-orange-500/20">Rebalance</span>
+                              ) : (tr.source ?? "deposit") === "withdrawal" ? (
+                                <span className="text-xs px-1.5 py-0.5 rounded bg-red-500/15 text-red-300 border border-red-500/20">Saque</span>
+                              ) : (
+                                <span className="text-xs px-1.5 py-0.5 rounded bg-blue-500/15 text-blue-300 border border-blue-500/20">Dep\u00f3sito</span>
+                              )}
                             </td>
                             <td className="py-2 font-mono text-white">{String(tr.symbol ?? tr.s ?? "—")}</td>
                             <td className={`py-2 font-medium ${String(tr.side).toUpperCase() === "BUY" ? "text-green-400" : "text-red-400"}`}>{String(tr.side ?? "—").toUpperCase()}</td>
@@ -1607,7 +1671,8 @@ export default function AdminPage() {
                     </tbody>
                   </table>
                 </div>
-              )}
+                ) : null;
+              })()}
             </>
           )}
 
@@ -1763,7 +1828,8 @@ export default function AdminPage() {
             </>
           )}
 
-          {/* ── FEES TAB ──────────────────────────────────────────────────── */}
+          {/* ── ANNOUNCEMENTS TAB ─────────────────────────────────────────── */}
+
           {activeTab === "fees" && (
             <div className="space-y-4">
               <div className="flex items-center justify-between">
@@ -1796,6 +1862,7 @@ export default function AdminPage() {
 
               {feesSummary && (
                 <>
+                  {/* Cards de totais */}
                   <div className="grid grid-cols-3 gap-3">
                     <div className="bg-white/5 rounded-lg p-4 border border-white/10">
                       <div className="text-white/40 text-xs mb-1">Total Coletado</div>
@@ -1814,6 +1881,7 @@ export default function AdminPage() {
                     </div>
                   </div>
 
+                  {/* Pendentes */}
                   <div className="bg-white/5 rounded-lg p-4 border border-white/10">
                     <div className="text-white/60 text-xs font-medium mb-3 uppercase tracking-wide">Pendente (próxima cobrança)</div>
                     <div className="space-y-2">
@@ -1825,7 +1893,7 @@ export default function AdminPage() {
                       ))}
                       {feesSummary.pending.performance.map((p: any) => (
                         <div key={p.portfolio_id} className="flex justify-between text-sm">
-                          <span className="text-white/50">{p.index_name} — performance</span>
+                          <span className="text-white/50">{p.index_name} — performance (ganho ${p.gain_above_hwm.toFixed(2)})</span>
                           <span className="text-purple-400 font-mono">${p.fee_amount_usd.toFixed(4)}</span>
                         </div>
                       ))}
@@ -1849,7 +1917,7 @@ export default function AdminPage() {
                         <button
                           onClick={async () => {
                             if (!session) return;
-                            if (!confirm("Cobrar taxas agora?")) return;
+                            if (!confirm("Cobrar taxas agora? Isso reduzirá o AUM e os portfolios.")) return;
                             const r = await feesApi.collect(session.address, session.message, session.signature, false);
                             alert("Cobrado: management $" + r.management_fees.total_usd.toFixed(4) + " + performance $" + r.performance_fees.total_usd.toFixed(4));
                             const d = await feesApi.getSummary(session.address, session.message, session.signature);
@@ -1863,6 +1931,7 @@ export default function AdminPage() {
                     </div>
                   </div>
 
+                  {/* Histórico */}
                   <div className="bg-white/5 rounded-lg border border-white/10 overflow-hidden">
                     <div className="p-4 border-b border-white/10 text-white/60 text-xs font-medium uppercase tracking-wide">Histórico de Cobranças</div>
                     <div className="overflow-x-auto">
@@ -1898,8 +1967,6 @@ export default function AdminPage() {
               )}
             </div>
           )}
-
-          {/* ── ANNOUNCEMENTS TAB ─────────────────────────────────────────── */}
           {activeTab === "announcements" && (
             <>
               {/* Header */}

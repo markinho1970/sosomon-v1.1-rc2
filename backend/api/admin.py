@@ -368,20 +368,16 @@ async def admin_trades(network_mode: str = "mainnet", limit: int = 50, db: Sessi
                 "quantity":        r.quantity,
                 "price":           r.price_usd,
                 "usd_value":       round(r.notional_usd, 2),
-                "fee_usd":         round(getattr(r, "fee_usd", 0) or 0, 6),
-                "fee_pct":         getattr(r, "fee_pct", 0.001) or 0.001,
-                "fee_reason":      getattr(r, "fee_reason", "") or "",
                 "status":          r.status,
                 "skip_reason":     r.skip_reason,
                 "source":          r.source,
-                "proposal_id":     r.proposal_id,
                 "index_id":        r.index_id,
                 "order_id":        r.order_id,
                 "timestamp":       r.executed_at.isoformat() if r.executed_at else "",
                 "is_simulated":    False,
                 "investor_wallet": wallet,
             })
-        return {"data": trades, "count": len(trades), "total_fees_usd": round(sum(t["fee_usd"] for t in trades), 6)}
+        return {"data": trades, "count": len(trades)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -911,6 +907,7 @@ async def fees_summary(
     """Resumo de taxas coletadas e pendentes."""
     import json as _json
 
+    # Histórico de fees já coletadas
     collected = (
         db.query(AgentActivityLog)
         .filter(AgentActivityLog.agent == "fee_manager")
@@ -945,6 +942,7 @@ async def fees_summary(
             "description": log.description,
         })
 
+    # Taxas pendentes — simula o que seria cobrado agora
     from services.fee_manager import _monthly_mgmt_rate, PERFORMANCE_FEE_PCT
     pending_mgmt = []
     pending_perf = []
