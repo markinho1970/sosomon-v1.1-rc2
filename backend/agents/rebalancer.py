@@ -19,10 +19,11 @@ from loguru import logger
 from services.llm import generate
 
 from database import SessionLocal
-from models import AlphaIndex, IndexConstituent, AgentActivityLog, ScoutReport, RebalanceProposal
+from models import AlphaIndex, IndexConstituent, AgentActivityLog, ScoutReport, RebalanceProposal, TradeExecution
 from services.sosovalue import get_macro_context, get_stablecoin_buffer_from_sentiment
 from services.sodex import (
     get_all_tickers,
+    get_markets,
     get_portfolio_snapshot,
     execute_rebalance_trades,
 )
@@ -249,7 +250,7 @@ def _check_min_order_viability(changes: List[Dict], snapshot: Dict):
     # Normaliza positions para dict keyed por symbol
     raw_positions = snapshot.get("positions", [])
     if isinstance(raw_positions, list):
-        positions = {p.get("symbol", ""): p for p in raw_positions}
+        positions = {p.get("asset", p.get("symbol", "")): p for p in raw_positions}
     else:
         positions = raw_positions
 
@@ -262,7 +263,7 @@ def _check_min_order_viability(changes: List[Dict], snapshot: Dict):
 
         symbol = change["symbol"]
         pos = positions.get(symbol, {})
-        current_usd = pos.get("value_usd", 0) if pos else 0
+        current_usd = pos.get("usd_value", pos.get("value_usd", 0)) if pos else 0
         current_pct = (current_usd / total_usd * 100) if total_usd > 0 else 0
         target_pct = change.get("new_weight", 0)
         trade_usd = abs(target_pct - current_pct) / 100 * total_usd if total_usd > 0 else 0
@@ -580,6 +581,117 @@ def _log_no_action(index_id: str, db):
     db.commit()
 
 
+async def _execute_full_rebalance(
+    snapshot: dict,
+    all_basket,               # list[IndexConstituent] — tokens atuais da cesta
+    new_target_weights: dict, # {symbol: pct} — nova composição alvo (sem zeros)
+    dry_run: bool,
+    testnet: bool,
+) -> list:
+    """
+    Full rebalance: vende TODOS os tokens da cesta atual, depois recompra
+    todos os tokens da nova composição. Garante 100% reinvestimento sem
+    USDC sobrando fora do NAV.
+
+    Dry run simula as ordens de compra com base nos proceeds estimados das vendas.
+    """
+    import math as _math_fr
+    # Monta índice de posições para lookup rápido (com e sem prefixo v)
+    _pos_idx: dict = {}
+    for p in snapshot["positions"]:
+        raw = p.get("asset", "")
+        _pos_idx[raw] = p
+        stripped = raw.lstrip("v").lstrip("V")
+        if stripped != raw: _pos_idx[stripped] = p
+        nodot = stripped.replace(".", "")
+        if nodot != stripped: _pos_idx[nodot] = p
+
+    # Phase 1: vende TODOS os tokens de investimento (nao operacionais).
+    # FULL mode = liquidacao total, independente de estar ou nao na nova composicao.
+    # Tokens operacionais (USDC, ETH, stablecoins) sao preservados.
+    _OPERATIONAL = {"USDC", "USDT", "USD", "ETH", "WETH", "DAI", "BUSD"}
+    sell_targets = {}
+    for _p in snapshot["positions"]:
+        _raw = _p.get("asset", "")
+        _clean = _raw.lstrip("v").lstrip("V")
+        _nodot = _clean.replace(".", "")
+        # pula tokens operacionais
+        if _clean in _OPERATIONAL or _nodot in _OPERATIONAL or _raw in _OPERATIONAL:
+            continue
+        if _p.get("usd_value", 0) > 0.50:
+            sell_targets[_nodot or _clean or _raw] = 0.0
+
+    logger.info(
+        f"Full rebalance Phase 1: vender {list(sell_targets.keys())} | "
+        f"Phase 2: comprar {list(new_target_weights.keys())}"
+    )
+
+    sell_orders = await execute_rebalance_trades(
+        target_weights=sell_targets,
+        dry_run=dry_run,
+        testnet=testnet,
+    )
+
+    if dry_run:
+        # Simula Phase 2 com base nos proceeds estimados das vendas (dry_run)
+        fee_rate = 0.001  # 0.1% SoDEX maker/taker
+        sell_proceeds = sum(
+            o.get("usd_value", 0) * (1 - fee_rate)
+            for o in sell_orders
+            if o.get("status") == "dry_run"
+        )
+        # USDC operacional já existente na conta (não é usado para compra)
+        op_usdc = _pos_idx.get("USDC", _pos_idx.get("vUSDC", {})).get("usd_value", 0)
+        available_usdc = sell_proceeds  # proceeds das vendas (não toca o USDC operacional)
+
+        tickers = await get_all_tickers()
+        markets = await get_markets(testnet=testnet)
+        mkt_info: dict = {}
+        for _m in markets:
+            _base = _m.get("baseCoin", "").lstrip("v").lstrip("V").replace(".", "").upper()
+            mkt_info[_base] = _m
+
+        buy_orders = []
+        # Normaliza pesos para garantir soma = 100%
+        total_pct = sum(new_target_weights.values())
+        for sym, pct in new_target_weights.items():
+            if sym in ("USDC", "USDT", "USD"):
+                continue
+            normalized_pct = pct / total_pct * 100
+            buy_usd = available_usdc * (normalized_pct / 100)
+            if buy_usd < 1.0:
+                continue
+            ticker = tickers.get(f"{sym}-USDC", {})
+            price = float(ticker.get("lastPrice") or ticker.get("lastPx") or ticker.get("c") or 0)
+            mkt = mkt_info.get(sym.upper(), {})
+            qty_prec = int(mkt.get("quantityPrecision") or 4)
+            px_prec = int(mkt.get("pricePrecision") or 2)
+            qty = _math_fr.floor((buy_usd / price if price > 0 else 0) * 10**qty_prec) / 10**qty_prec if price > 0 else 0
+            buy_orders.append({
+                "symbol":    f"{sym}-USDC",
+                "side":      "BUY",
+                "quantity":  f"{qty:.{qty_prec}f}",
+                "price":     f"{price:.{px_prec}f}" if price > 0 else "0",
+                "usd_value": round(buy_usd, 4),
+                "reason":    f"Full rebalance: {sym} 0.0% -> {normalized_pct:.1f}%",
+                "status":    "dry_run",
+            })
+            logger.info(
+                f"[DRY RUN] Full BUY {sym}: ${buy_usd:.2f} "
+                f"(proceeds=${sell_proceeds:.2f} × {normalized_pct:.1f}%)"
+            )
+        return sell_orders + buy_orders
+
+    else:
+        # Live Phase 2: executa compras (snapshot terá USDC das vendas)
+        buy_orders = await execute_rebalance_trades(
+            target_weights=new_target_weights,
+            dry_run=False,
+            testnet=testnet,
+        )
+        return sell_orders + buy_orders
+
+
 async def apply_proposal(proposal_id: int, db, dry_run: bool = False):
     """
     Executa proposta aprovada de rebalanceamento via SoDEX API.
@@ -602,6 +714,15 @@ async def apply_proposal(proposal_id: int, db, dry_run: bool = False):
         network_mode = proposal.network_mode or "mainnet"
         _use_testnet = (network_mode == "testnet")
 
+        # Normaliza: scout pode gerar target_weight em vez de new_weight — unifica aqui
+        normalized_changes = []
+        for ch in (proposal.changes or []):
+            c = dict(ch)
+            if "new_weight" not in c and "target_weight" in c:
+                c["new_weight"] = c["target_weight"]
+            normalized_changes.append(c)
+        proposal.changes = normalized_changes
+
         # 1. Snapshot atual do portfolio no SoDEX (gateway correto por rede)
         snapshot = await get_portfolio_snapshot(testnet=_use_testnet)
         logger.info(
@@ -619,30 +740,185 @@ async def apply_proposal(proposal_id: int, db, dry_run: bool = False):
                 f"notional ${s.get('trade_usd', 0):.2f} < mínimo ${MIN_ORDER_USD:.0f} (below_min_notional)"
             )
 
-        # Monta mapa de pesos alvo somente das ordens viáveis
-        target_weights = {
-            c["symbol"]: c["new_weight"]
-            for c in viable_changes
-            if c.get("action") != "remove"
-        }
+        # Monta mapa de pesos alvo com renormalização proporcional (Option C):
+        # Quando remove um token e adiciona outro com peso diferente,
+        # os tokens permanentes absorvem proporcionalmente o peso liberado,
+        # garantindo que a soma dos pesos = 100% e nenhum USDC sobra sem ser reinvestido.
+        removed_syms  = {c["symbol"] for c in viable_changes if c.get("action") == "remove"}
+        added_weights = {c["symbol"]: c["new_weight"] for c in viable_changes if c.get("action") != "remove"}
 
-        # 3. Executa ordens reais no SoDEX (ou simula se dry_run=True)
-        executed_orders = await execute_rebalance_trades(
-            target_weights=target_weights,
-            dry_run=dry_run,
-            testnet=_use_testnet,
-        )
+        target_weights = {}
+        # Tokens removidos: SELL tudo (peso 0)
+        for sym in removed_syms:
+            target_weights[sym] = 0.0
+
+        # Pesos alocados para tokens novos
+        allocated_pct = sum(added_weights.values())
+
+        # Busca constituintes atuais da cesta (excluindo os que serão removidos)
+        _constituents = db.query(IndexConstituent).filter(
+            IndexConstituent.index_id == proposal.index_id,
+            IndexConstituent.in_basket == True,
+            IndexConstituent.network_mode == network_mode,
+        ).all()
+        permanent = [c for c in _constituents if c.symbol not in removed_syms and c.symbol not in added_weights]
+
+        # Renormaliza os permanentes para preencher o espaço restante (100% - allocated_pct)
+        remaining_pct = 100.0 - allocated_pct
+        perm_current_total = sum(getattr(c, "weight", 0) or 0 for c in permanent)
+        if permanent and perm_current_total > 0 and remaining_pct > 0:
+            for c in permanent:
+                w = getattr(c, "weight", 0) or 0
+                target_weights[c.symbol] = round(w / perm_current_total * remaining_pct, 4)
+            logger.info(
+                f"Rebalancer: renormalização proporcional — {len(permanent)} tokens permanentes redistribuem "                f"{remaining_pct:.2f}% (tokens adicionados alocam {allocated_pct:.2f}%)"
+            )
+
+        # Adiciona tokens novos com seus pesos definidos
+        target_weights.update(added_weights)
+
+        logger.info(f"Rebalancer: target_weights finais = {target_weights}")
+
+        # 3. Executa ordens no SoDEX — FULL ou DELTA mode automático.
+        # FULL: vende tudo e recompra tudo quando delta-only produziria ordens < $5 (mínimo SoDEX).
+        # DELTA: só os ajustes necessários (mais eficiente, menos taxas).
+        _sodex_min = 5.0
+        _total_snap = snapshot["total_usd"]
+        _needs_full = False
+        # Checa se algum ajuste para token permanente ficaria abaixo do mínimo
+        _pos_snap: dict = {}
+        for _p in snapshot["positions"]:
+            _r = _p.get("asset", "")
+            _pos_snap[_r] = _p
+            _s = _r.lstrip("v").lstrip("V")
+            if _s != _r: _pos_snap[_s] = _p
+            _nd = _s.replace(".", "")
+            if _nd != _s: _pos_snap[_nd] = _p
+        for _sym, _pct in target_weights.items():
+            if _pct == 0.0: continue  # SELL total — ok, valor da posicao e grande
+            _cur = _pos_snap.get(_sym, {}).get("usd_value", 0)
+            _tgt = _total_snap * (_pct / 100)
+            _delta = abs(_tgt - _cur)
+            if 0.50 < _delta < _sodex_min:
+                _needs_full = True
+                logger.info(
+                    f"Rebalancer: FULL mode — {_sym} delta ${_delta:.2f} < ${_sodex_min} "
+                    f"(minimo SoDEX). Iniciando full rebalance."
+                )
+                break
+
+        if _needs_full:
+            _new_weights = {s: p for s, p in target_weights.items() if p > 0}
+            executed_orders = await _execute_full_rebalance(
+                snapshot=snapshot,
+                all_basket=_constituents,
+                new_target_weights=_new_weights,
+                dry_run=dry_run,
+                testnet=_use_testnet,
+            )
+        else:
+            executed_orders = await execute_rebalance_trades(
+                target_weights=target_weights,
+                dry_run=dry_run,
+                testnet=_use_testnet,
+            )
 
         logger.info(f"Rebalancer: {len(executed_orders)} ordens {'simuladas' if dry_run else 'executadas'} no SoDEX")
 
+        # ══════════════════════════════════════════════════════════════════════════
+        # CONSISTÊNCIA CRÍTICA — GUARD FORTE (3 camadas)
+        # Regra: o basket no DB SÓ é atualizado se TODAS as ordens críticas forem
+        # confirmadas como "placed" pelo SoDEX. Qualquer falha → raise → rollback.
+        # Isso garante que DB basket == portfolio real SoDEX SEMPRE.
+        # ══════════════════════════════════════════════════════════════════════════
+        if not dry_run and len(viable_changes) > 0:
+            placed_orders = [o for o in executed_orders if o.get("status") == "placed"]
+            placed_syms   = {o["symbol"].replace("-USDC", "") for o in placed_orders}
+
+            # Camada 1: pelo menos UMA ordem confirmada
+            if not placed_orders:
+                failed_syms = [c["symbol"] for c in viable_changes]
+                unplaced = [(o["symbol"], o.get("status")) for o in executed_orders] if executed_orders else []
+                raise ValueError(
+                    "GUARD: Nenhuma ordem confirmada no SoDEX para " + str(failed_syms) +
+                    " (tentativas: " + str(unplaced) + ") — DB nao atualizado."
+                )
+
+            # Camada 2: todos os SELLs de tokens REMOVIDOS devem estar placed
+            # (sem SELL confirmado = token ainda no SoDEX = basket DB estaria errado)
+            _removed_in_changes = [c["symbol"] for c in viable_changes if c.get("action") == "remove"]
+            for _sym in _removed_in_changes:
+                if _sym not in placed_syms:
+                    raise ValueError(
+                        f"GUARD: SELL de {_sym} nao confirmado no SoDEX — "
+                        f"token ainda existe no portfolio. DB nao atualizado. "
+                        f"Ordens placed: {list(placed_syms)}"
+                    )
+
+            # Camada 3: tokens ADICIONADOS devem ter BUY placed
+            _added_in_changes = [c["symbol"] for c in viable_changes if c.get("action") != "remove"]
+            for _sym in _added_in_changes:
+                if _sym not in placed_syms:
+                    logger.warning(
+                        f"GUARD: BUY de {_sym} nao confirmado no SoDEX — "
+                        f"token nao entrou no portfolio. DB nao atualizado para este token."
+                    )
+                    # Remove este token das changes para nao atualizar basket incorretamente
+                    proposal.changes = [
+                        c for c in proposal.changes
+                        if not (c.get("action") != "remove" and c["symbol"] == _sym)
+                    ]
+
+            logger.info(
+                f"GUARD OK: {len(placed_orders)} ordens confirmadas no SoDEX — "
+                f"SELLs: {[s for s in _removed_in_changes if s in placed_syms]} | "
+                f"BUYs: {[s for s in _added_in_changes if s in placed_syms]}"
+            )
+
         # Salva as ordens executadas (com order IDs) no banco como evidência
         proposal.execution_orders = executed_orders
+        # Registra cada ordem como TradeExecution com rastreabilidade de taxas.
+        # Fee estimada 0.1% do notional (padrao SoDEX). Investidor paga via reducao do NAV.
+        if not dry_run:
+            removed_syms = [c["symbol"] for c in proposal.changes if c.get("action") == "remove"]
+            added_syms   = [c["symbol"] for c in proposal.changes if c.get("action") == "add"]
+            if removed_syms and added_syms:
+                rsuffix = " (" + ", ".join(removed_syms) + " -> " + ", ".join(added_syms) + ")"
+            elif removed_syms:
+                rsuffix = " (saida: " + ", ".join(removed_syms) + ")"
+            elif added_syms:
+                rsuffix = " (entrada: " + ", ".join(added_syms) + ")"
+            else:
+                rsuffix = ""
+            for order in executed_orders:
+                if order.get("status") not in ("placed", "dry_run"):
+                    continue
+                sym      = order["symbol"].replace("-USDC", "")
+                notional = float(order.get("usd_value", 0))
+                fee_usd  = round(notional * 0.001, 6)
+                slabel   = "SELL" if order["side"] == "SELL" else "BUY"
+                reason   = "Rebalance #" + str(proposal_id) + ": " + slabel + " " + sym + rsuffix
+                trade = TradeExecution(
+                    source="rebalance", proposal_id=proposal_id,
+                    index_id=proposal.index_id, network_mode=network_mode,
+                    symbol=sym, side=order["side"].lower(),
+                    quantity=float(order.get("quantity", 0)),
+                    price_usd=float(order.get("price", 0)),
+                    notional_usd=notional, fee_usd=fee_usd, fee_pct=0.001,
+                    fee_reason=reason, status="filled",
+                    order_id=order.get("order_id", ""),
+                    executed_at=datetime.utcnow(),
+                )
+                db.add(trade)
+                logger.info("TradeExecution: " + reason + " | notional=$" + str(round(notional,2)) + " fee=$" + str(fee_usd))
+
 
         # 4. Busca preços ao vivo para inicializar price_at_nav_ref de novos tokens
         live_tickers = await get_all_tickers()
 
         # 5. Atualiza constituents no banco
         for change in proposal.changes:
+            if dry_run: continue  # nao atualiza basket em simulacao
             # Filtra por network_mode para evitar atualizar a rede errada
             constituent = db.query(IndexConstituent).filter(
                 IndexConstituent.index_id == proposal.index_id,
@@ -694,8 +970,9 @@ async def apply_proposal(proposal_id: int, db, dry_run: bool = False):
                         f"(price_at_nav_ref=${live_price:.4f}, rede={network_mode})"
                     )
 
-        proposal.status = "executed" if not dry_run else "dry_run"
-        proposal.executed_at = datetime.utcnow()
+        proposal.status = "executed" if not dry_run else "approved"  # dry_run nao muda status
+        if not dry_run:
+            proposal.executed_at = datetime.utcnow()
 
         # Update index last_rebalanced_at
         idx = db.query(AlphaIndex).filter(AlphaIndex.id == proposal.index_id).first()
@@ -708,7 +985,14 @@ async def apply_proposal(proposal_id: int, db, dry_run: bool = False):
 
     except Exception as e:
         logger.error(f"Proposal execution failed: {e}")
-        proposal.status = "failed"
-        proposal.execution_error = str(e)
-        db.commit()
+        # CRITICO: rollback desfaz mudancas pendentes (basket) antes de commitar
+        try:
+            db.rollback()
+            _p = db.query(RebalanceProposal).filter_by(id=proposal_id).first()
+            if _p:
+                _p.status = "failed"
+                _p.execution_error = str(e)[:2000]
+            db.commit()
+        except Exception as _ce:
+            logger.error(f"Erro ao salvar status failed: {_ce}")
         raise

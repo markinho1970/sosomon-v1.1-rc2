@@ -341,4 +341,19 @@ export const adminAnnouncementApi = {
   },
 };
 
+export const feesApi = {
+  getSummary: async (address: string, message: string, signature: string) => {
+    const { data } = await api.get('/api/admin/fees/summary', adminHeaders(address, message, signature));
+    return data;
+  },
+  collect: async (address: string, message: string, signature: string, dryRun = true) => {
+    const { data } = await api.post(`/api/admin/fees/collect?dry_run=${dryRun}`, {}, adminHeaders(address, message, signature));
+    return data;
+  },
+  getHistory: async (address: string, message: string, signature: string, limit = 50) => {
+    const { data } = await api.get(`/api/admin/fees/history?limit=${limit}`, adminHeaders(address, message, signature));
+    return data;
+  },
+};
+
 export default api;

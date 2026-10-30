@@ -292,6 +292,9 @@ class TradeExecution(Base):
     status         = Column(String, nullable=False, default="filled")  # 'filled' | 'skipped' | 'failed'
     skip_reason    = Column(String, nullable=True)
     order_id       = Column(String, nullable=True)           # ID da ordem no SoDEX
+    fee_usd        = Column(Float, default=0.0)              # taxa cobrada pelo SoDEX em USD
+    fee_pct        = Column(Float, default=0.001)            # % da taxa (0.001 = 0.1%)
+    fee_reason     = Column(String, nullable=True)           # ex: "Rebalance #157: SELL UNI substituída por HYPE"
     executed_at    = Column(DateTime, nullable=False, default=datetime.utcnow)
     created_at     = Column(DateTime, default=datetime.utcnow)
 
@@ -311,3 +314,31 @@ class Announcement(Base):
     published_at     = Column(DateTime, nullable=True)
     is_active        = Column(Boolean, nullable=False, default=True)
     created_at       = Column(DateTime, default=datetime.utcnow)
+
+
+class UniverseAsset(Base):
+    """Snapshot diário de todos os ativos do universo SoSoValue+SoDEX."""
+    __tablename__ = "universe_assets"
+
+    id              = Column(Integer, primary_key=True, autoincrement=True)
+    symbol          = Column(String, nullable=False)
+    name            = Column(String, nullable=True)
+    theme           = Column(String, nullable=False)          # depin | ai-crypto | rwa
+    currency_id     = Column(String, nullable=True)
+    ssi_weight      = Column(Float, default=0.0)             # peso no índice SSI (%)
+    marketcap       = Column(Float, default=0.0)
+    mcap_rank       = Column(Integer, default=999)
+    volume_24h      = Column(Float, default=0.0)
+    vol_mcap_ratio  = Column(Float, default=0.0)
+    roi_7d          = Column(Float, default=0.0)
+    roi_30d         = Column(Float, default=0.0)
+    roi_3m          = Column(Float, default=0.0)
+    high_3m         = Column(Float, default=0.0)             # máxima dos últimos 91d
+    dist_from_high  = Column(Float, default=0.0)             # % abaixo da máxima 3m
+    beta_vs_ssi     = Column(Float, default=1.0)             # beta vs índice SSI do tema
+    current_price   = Column(Float, default=0.0)
+    in_basket       = Column(Boolean, default=False)
+    is_anchor       = Column(Boolean, default=False)
+    sodex_listed    = Column(Boolean, default=False)
+    sodex_status    = Column(String, default="UNKNOWN")      # TRADING | HALT | UNKNOWN
+    updated_at      = Column(DateTime, default=datetime.utcnow)

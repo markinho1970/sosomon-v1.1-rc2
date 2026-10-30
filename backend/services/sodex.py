@@ -314,23 +314,40 @@ async def place_order(
         "orders": [order],
     }
 
+    _body = json.dumps(payload, separators=(",", ":"))
+    _hdrs = _sign(payload, testnet, ACTION_BATCH_NEW_ORDER)
+    logger.info("[SODEX] place_order " + str(symbol) + " " + str(side) + " qty=" + str(quantity) + " price=" + str(price))
+    logger.info("[SODEX] body: " + _body)
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as c:
             r = await c.post(
                 f"{_spot_url(testnet)}/trade/orders/batch",
-                headers=_sign(payload, testnet, ACTION_BATCH_NEW_ORDER),
-                content=json.dumps(payload, separators=(",", ":")),
+                headers=_hdrs,
+                content=_body,
             )
+            _raw = r.text
+            logger.info("[SODEX] HTTP " + str(r.status_code) + " resp: " + _raw[:800])
+            import time as _tm
+            _ts = _tm.strftime("%H:%M:%S")
+            _sep = chr(10) + "=== " + _ts + " " + str(symbol) + " " + str(side) + " ===" + chr(10)
+            with open("/tmp/sodex_orders.log", "a") as _lf:
+                _lf.write(_sep)
+                _lf.write("BODY: " + _body + chr(10))
+                _lf.write("HTTP " + str(r.status_code) + ": " + _raw + chr(10))
             r.raise_for_status()
             result = r.json()
             if result.get("code", 0) != 0:
                 err = result.get("error") or result.get("msg") or str(result)
-                logger.error(f"SoDEX place_order({symbol}): API error code={result.get('code')} — {err}")
+                _code_val = str(result.get("code"))
+                logger.error("[SODEX] place_order API error code=" + _code_val + " " + str(err) + " | FULL: " + str(result))
                 return None
-            logger.success(f"SoDEX order placed: {side} {quantity} {symbol} @ {price or 'market'}")
+            logger.success("SoDEX order placed: " + str(side) + " " + str(quantity) + " " + str(symbol) + " @ " + str(price or 'market'))
             return result
     except Exception as e:
-        logger.error(f"SoDEX place_order({symbol}): {e}")
+        logger.error("[SODEX] place_order exception " + str(symbol) + ": " + str(e))
+        import time as _tm2
+        with open("/tmp/sodex_orders.log", "a") as _lf:
+            _lf.write(chr(10) + "EXCEPTION " + _tm2.strftime("%H:%M:%S") + " " + str(symbol) + ": " + str(e) + chr(10))
         return None
 
 
@@ -443,7 +460,14 @@ async def execute_rebalance_trades(
     import math as _math
     snapshot  = await get_portfolio_snapshot(testnet=testnet)
     total_usd = snapshot["total_usd"]
-    current   = {p["asset"]: p for p in snapshot["positions"]}
+    current: dict = {}
+    for _p in snapshot["positions"]:
+        _raw = _p.get("asset", "")
+        current[_raw] = _p
+        _stripped = _raw.lstrip("v").lstrip("V")
+        if _stripped and _stripped != _raw: current[_stripped] = _p
+        _nodot = _stripped.replace(".", "")
+        if _nodot and _nodot != _stripped: current[_nodot] = _p
     tickers   = await get_all_tickers()
     markets   = await get_markets(testnet=testnet)
     mkt_info_rb: Dict[str, dict] = {}
@@ -454,7 +478,13 @@ async def execute_rebalance_trades(
 
     orders = []
 
-    for asset, target_pct in target_weights.items():
+    # SELLs antes de BUYs para garantir liquidez USDC
+    sorted_targets = sorted(
+        target_weights.items(),
+        key=lambda x: 0 if (total_usd * (x[1] / 100) - current.get(x[0], {}).get("usd_value", 0)) < 0 else 1
+    )
+
+    for asset, target_pct in sorted_targets:
         if asset in ("USDC", "USDT", "USD"):
             continue
 
@@ -462,7 +492,7 @@ async def execute_rebalance_trades(
         current_usd = current.get(asset, {}).get("usd_value", 0)
         diff_usd    = target_usd - current_usd
 
-        if abs(diff_usd) < 10:
+        if abs(diff_usd) < 0.50:
             continue
 
         sym    = f"{asset}-USDC"

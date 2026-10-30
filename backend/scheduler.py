@@ -81,6 +81,20 @@ def run_announcement_fetcher():
         db.close()
 
 
+def run_universe_refresh():
+    from database import SessionLocal
+    from services.universe import refresh_universe
+    logger.info("Scheduler: starting Universe refresh")
+    db = SessionLocal()
+    try:
+        count = _run_async(refresh_universe(db))
+        logger.info(f"Scheduler: Universe refresh done, {count} assets")
+    except Exception as e:
+        logger.error(f"Scheduler: Universe refresh failed: {e}")
+    finally:
+        db.close()
+
+
 def start_scheduler():
     scheduler.add_job(run_scout, CronTrigger(hour=6, minute=0),
                       id="scout_daily", replace_existing=True)
@@ -109,8 +123,12 @@ def start_scheduler():
     scheduler.add_job(run_announcement_fetcher, IntervalTrigger(hours=2),
                       id="announcement_fetcher", replace_existing=True)
 
+    # Universe Refresh: 05:00 UTC diário — antes do Scout (06:00)
+    scheduler.add_job(run_universe_refresh, CronTrigger(hour=5, minute=0),
+                      id="universe_refresh_daily", replace_existing=True)
+
     scheduler.start()
-    logger.info("Scheduler started: Scout(06:00), Rebalancer(drift/4h), Narrator(Sun 18:00), DepositMonitor Mainnet+Testnet(2min), NAVUpdater(1h), FeeManager(dia1 08:00), AnnouncementFetcher(2h)")
+    logger.info("Scheduler started: Scout(06:00), Rebalancer(drift/4h), Narrator(Sun 18:00), DepositMonitor Mainnet+Testnet(2min), NAVUpdater(1h), FeeManager(dia1 08:00), AnnouncementFetcher(2h), UniverseRefresh(05:00)")
 
 
 def stop_scheduler():

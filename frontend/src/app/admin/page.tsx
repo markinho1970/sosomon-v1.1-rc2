@@ -11,12 +11,12 @@ import {
   TrendingUp, TrendingDown, Scale, Megaphone, Plus, Eye, EyeOff,
 } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
-import { adminApi, investApi, adminAnnouncementApi, type SystemAlert } from "@/lib/api";
+import { adminApi, investApi, adminAnnouncementApi, feesApi, type SystemAlert } from "@/lib/api";
 import type { Announcement } from "@/types";
 import { useLang } from "@/lib/LanguageContext";
 import { LANGUAGES, type Lang } from "@/lib/i18n/translations";
 
-type AdminTab = "overview" | "proposals" | "indexes" | "treasury" | "investors" | "trades" | "agents" | "announcements";
+type AdminTab = "overview" | "proposals" | "indexes" | "treasury" | "investors" | "trades" | "agents" | "announcements" | "fees";
 
 interface Proposal {
   id: number;
@@ -234,6 +234,8 @@ export default function AdminPage() {
   const [loading, setLoading] = useState(false);
   const [loadingPortfolio, setLoadingPortfolio] = useState(false);
   const [loadingTrades, setLoadingTrades] = useState(false);
+  const [feesSummary, setFeesSummary] = useState<any>(null);
+  const [feesLoading, setFeesLoading] = useState(false);
   const [loadingFundWallet, setLoadingFundWallet] = useState(false);
   const [loadingMovements, setLoadingMovements] = useState(false);
   const [loadingReport, setLoadingReport] = useState(false);
@@ -678,6 +680,7 @@ export default function AdminPage() {
     { id: "investors",  icon: Users,           label: t("admin_tab_investors_tab"), badge: 0 },
     { id: "trades",     icon: ArrowRightLeft,  label: t("admin_tab_trades"),        badge: 0 },
     { id: "agents",     icon: Cpu,             label: t("admin_tab_agents"),        badge: 0 },
+    { id: "fees",       icon: DollarSign,      label: "Taxas",                      badge: 0 },
     { id: "announcements", icon: Megaphone,    label: "Anúncios",                   badge: 0 },
   ];
 
@@ -1758,6 +1761,142 @@ export default function AdminPage() {
                 </div>
               </div>
             </>
+          )}
+
+          {/* ── FEES TAB ──────────────────────────────────────────────────── */}
+          {activeTab === "fees" && (
+            <div className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="font-semibold text-white flex items-center gap-2 text-sm">
+                  <DollarSign size={14} className="text-brand-blue" /> Gestão de Taxas
+                </h2>
+                <button
+                  onClick={async () => {
+                    if (!session) return;
+                    setFeesLoading(true);
+                    try {
+                      const d = await feesApi.getSummary(session.address, session.message, session.signature);
+                      setFeesSummary(d);
+                    } catch(e) {}
+                    setFeesLoading(false);
+                  }}
+                  className="text-white/30 hover:text-white transition-colors flex items-center gap-1 text-xs"
+                >
+                  <RefreshCw size={13} className={feesLoading ? "animate-spin" : ""} />
+                  {feesSummary ? "Atualizar" : "Carregar"}
+                </button>
+              </div>
+
+              {!feesSummary && !feesLoading && (
+                <div className="text-white/30 text-sm text-center py-8">Clique em Carregar para ver o resumo de taxas.</div>
+              )}
+              {feesLoading && (
+                <div className="text-white/30 text-sm text-center py-8">Carregando...</div>
+              )}
+
+              {feesSummary && (
+                <>
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                      <div className="text-white/40 text-xs mb-1">Total Coletado</div>
+                      <div className="text-white font-mono text-lg">${feesSummary.collected.grand_total_usd.toFixed(4)}</div>
+                      <div className="text-white/30 text-xs mt-1">{feesSummary.collected.count} cobranças</div>
+                    </div>
+                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                      <div className="text-white/40 text-xs mb-1">Management Fees</div>
+                      <div className="text-green-400 font-mono text-lg">${feesSummary.collected.management_total_usd.toFixed(4)}</div>
+                      <div className="text-white/30 text-xs mt-1">{feesSummary.config.management_fee_annual_pct}%/ano</div>
+                    </div>
+                    <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                      <div className="text-white/40 text-xs mb-1">Performance Fees</div>
+                      <div className="text-purple-400 font-mono text-lg">${feesSummary.collected.performance_total_usd.toFixed(4)}</div>
+                      <div className="text-white/30 text-xs mt-1">{feesSummary.config.performance_fee_pct}% acima do HWM</div>
+                    </div>
+                  </div>
+
+                  <div className="bg-white/5 rounded-lg p-4 border border-white/10">
+                    <div className="text-white/60 text-xs font-medium mb-3 uppercase tracking-wide">Pendente (próxima cobrança)</div>
+                    <div className="space-y-2">
+                      {feesSummary.pending.management.map((m: any) => (
+                        <div key={m.index_id} className="flex justify-between text-sm">
+                          <span className="text-white/50">{m.index_name} — management</span>
+                          <span className="text-green-400 font-mono">${m.fee_amount_usd.toFixed(4)}</span>
+                        </div>
+                      ))}
+                      {feesSummary.pending.performance.map((p: any) => (
+                        <div key={p.portfolio_id} className="flex justify-between text-sm">
+                          <span className="text-white/50">{p.index_name} — performance</span>
+                          <span className="text-purple-400 font-mono">${p.fee_amount_usd.toFixed(4)}</span>
+                        </div>
+                      ))}
+                      {feesSummary.pending.management.length === 0 && feesSummary.pending.performance.length === 0 && (
+                        <div className="text-white/30 text-sm">Nenhuma taxa pendente agora.</div>
+                      )}
+                    </div>
+                    <div className="mt-3 flex items-center justify-between">
+                      <span className="text-white/30 text-xs">{feesSummary.config.collection_schedule}</span>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={async () => {
+                            if (!session) return;
+                            const r = await feesApi.collect(session.address, session.message, session.signature, true);
+                            alert("Simulação: management $" + r.management_fees.total_usd.toFixed(4) + " + performance $" + r.performance_fees.total_usd.toFixed(4));
+                          }}
+                          className="text-xs px-3 py-1.5 rounded border border-white/20 text-white/50 hover:text-white hover:border-white/40 transition-colors"
+                        >
+                          Simular
+                        </button>
+                        <button
+                          onClick={async () => {
+                            if (!session) return;
+                            if (!confirm("Cobrar taxas agora?")) return;
+                            const r = await feesApi.collect(session.address, session.message, session.signature, false);
+                            alert("Cobrado: management $" + r.management_fees.total_usd.toFixed(4) + " + performance $" + r.performance_fees.total_usd.toFixed(4));
+                            const d = await feesApi.getSummary(session.address, session.message, session.signature);
+                            setFeesSummary(d);
+                          }}
+                          className="text-xs px-3 py-1.5 rounded border border-green-500/40 text-green-400 hover:bg-green-500/10 transition-colors"
+                        >
+                          Cobrar Agora
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="bg-white/5 rounded-lg border border-white/10 overflow-hidden">
+                    <div className="p-4 border-b border-white/10 text-white/60 text-xs font-medium uppercase tracking-wide">Histórico de Cobranças</div>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-xs">
+                        <thead className="text-white/40 border-b border-white/5">
+                          <tr>
+                            <th className="text-left p-3">Data</th>
+                            <th className="text-left p-3">Tipo</th>
+                            <th className="text-left p-3">Índice</th>
+                            <th className="text-right p-3">Valor</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {feesSummary.collected.history.map((h: any) => (
+                            <tr key={h.id} className="border-b border-white/5 hover:bg-white/3">
+                              <td className="p-3 text-white/50 font-mono">{h.timestamp ? new Date(h.timestamp).toLocaleDateString("pt-BR") : "—"}</td>
+                              <td className="p-3">
+                                {h.type === "management_fee" ? (
+                                  <span className="px-1.5 py-0.5 rounded bg-green-500/15 text-green-300 border border-green-500/20">Management</span>
+                                ) : (
+                                  <span className="px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-300 border border-purple-500/20">Performance</span>
+                                )}
+                              </td>
+                              <td className="p-3 text-white/60">{h.index_name}</td>
+                              <td className="p-3 text-right font-mono text-white">${Number(h.fee_amount_usd).toFixed(4)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </>
+              )}
+            </div>
           )}
 
           {/* ── ANNOUNCEMENTS TAB ─────────────────────────────────────────── */}

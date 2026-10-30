@@ -46,9 +46,9 @@ _last_block = {"mainnet": 0, "testnet": 0}
 _RPC_FALLBACKS = {
     "mainnet": [
         os.getenv("BASE_RPC_URL", "https://base.drpc.org"),
-        "https://mainnet.base.org",
         "https://base-rpc.publicnode.com",
         "https://1rpc.io/base",
+        "https://mainnet.base.org",
     ],
     "testnet": [
         os.getenv("BASE_SEPOLIA_RPC_URL", "https://sepolia.base.org"),

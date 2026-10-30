@@ -10,7 +10,7 @@ from eth_account import Account
 
 from database import get_db
 from sqlalchemy import func
-from models import AlphaIndex, Subscriber, SubscriberPortfolio, AgentActivityLog, InvestmentIntent, InvestmentConsent, IndexConstituent, PortfolioSnapshot, RedemptionTransaction, DepositTransaction
+from models import AlphaIndex, Subscriber, SubscriberPortfolio, AgentActivityLog, InvestmentIntent, InvestmentConsent, IndexConstituent, PortfolioSnapshot, RedemptionTransaction, DepositTransaction, TradeExecution
 
 router = APIRouter(prefix="/api/invest", tags=["invest"])
 
@@ -1126,3 +1126,72 @@ def get_refunds(wallet_address: str, network_mode: str = "mainnet", db: Session 
                 "description": log.description,
             })
     return {"refunds": refunds}
+
+
+@router.get("/fee-statement/{wallet_address}")
+def get_fee_statement(wallet_address: str, network_mode: str = "mainnet", db: Session = Depends(get_db)):
+    """
+    Extrato completo de taxas pagas pelo investidor durante o período do investimento.
+    Inclui taxas de rebalanceamento (pagas implicitamente via NAV), com data, motivo e valor.
+    """
+    wallet = wallet_address.lower()
+
+    # Busca portfolios do investidor
+    sub = db.query(Subscriber).filter(
+        func.lower(Subscriber.wallet_address) == wallet
+    ).first()
+    if not sub:
+        return {"wallet": wallet_address, "portfolios": [], "total_fees_usd": 0.0, "trades": []}
+
+    portfolios = db.query(SubscriberPortfolio).filter(
+        SubscriberPortfolio.subscriber_id == sub.id,
+        SubscriberPortfolio.network_mode == network_mode,
+    ).all()
+
+    portfolio_ids = [p.id for p in portfolios]
+    index_ids = list({p.index_id for p in portfolios})
+
+    # Taxas de rebalance: afetam todos os investidores do índice proporcionalmente
+    # Buscamos todas as TradeExecution de rebalance dos índices do investidor
+    rebalance_trades = db.query(TradeExecution).filter(
+        TradeExecution.source == "rebalance",
+        TradeExecution.network_mode == network_mode,
+        TradeExecution.index_id.in_(index_ids),
+    ).order_by(TradeExecution.executed_at.desc()).all()
+
+    # Taxas de depósito: específicas do portfolio do investidor
+    deposit_trades = db.query(TradeExecution).filter(
+        TradeExecution.source == "deposit",
+        TradeExecution.portfolio_id.in_(portfolio_ids),
+        TradeExecution.network_mode == network_mode,
+    ).order_by(TradeExecution.executed_at.desc()).all()
+
+    all_trades = rebalance_trades + deposit_trades
+    all_trades.sort(key=lambda x: x.executed_at or datetime.min, reverse=True)
+
+    trades_out = []
+    total_fees = 0.0
+    for t in all_trades:
+        fee = getattr(t, "fee_usd", 0) or 0
+        total_fees += fee
+        trades_out.append({
+            "date":        t.executed_at.strftime("%Y-%m-%d %H:%M UTC") if t.executed_at else "",
+            "source":      t.source,
+            "index_id":    t.index_id,
+            "symbol":      t.symbol,
+            "side":        t.side.upper() if t.side else "",
+            "notional_usd": round(t.notional_usd, 4),
+            "fee_usd":     round(fee, 6),
+            "fee_pct_display": f"{(getattr(t, 'fee_pct', 0.001) or 0.001) * 100:.2f}%",
+            "reason":      getattr(t, "fee_reason", "") or t.source,
+            "order_id":    t.order_id or "",
+            "proposal_id": t.proposal_id,
+        })
+
+    return {
+        "wallet":          wallet_address,
+        "network_mode":    network_mode,
+        "total_fees_usd":  round(total_fees, 6),
+        "trade_count":     len(trades_out),
+        "trades":          trades_out,
+    }

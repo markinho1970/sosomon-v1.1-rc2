@@ -23,6 +23,7 @@ from api.audit import router as audit_router
 from api.performance import router as performance_router
 from api.faucet import router as faucet_router
 from api.announcements import router as announcements_router
+from api.universe import router as universe_router
 from scheduler import start_scheduler, stop_scheduler
 
 
@@ -65,6 +66,7 @@ app.include_router(audit_router)
 app.include_router(performance_router)
 app.include_router(faucet_router)
 app.include_router(announcements_router)
+app.include_router(universe_router)
 
 
 @app.get("/health")

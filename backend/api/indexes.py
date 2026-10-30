@@ -4,18 +4,50 @@ from sqlalchemy import func
 from datetime import datetime, timedelta
 
 from database import get_db
-from models import AlphaIndex, IndexConstituent, RebalanceProposal, SubscriberPortfolio, AgentActivityLog
+from models import AlphaIndex, IndexConstituent, RebalanceProposal, SubscriberPortfolio, AgentActivityLog, PortfolioSnapshot
 from schemas import IndexOut, ConstituentOut, ApiResponse
 
 router = APIRouter(prefix="/api/indexes", tags=["indexes"])
 
 
+
+def _calc_period_return(db, index_id: str, days: int) -> float:
+    # nav_per_token e identico para todos os investidores no mesmo indice.
+    # Basta um portfolio_id para nao multiplicar linhas por investidor.
+    from sqlalchemy import text as sa_text
+    cutoff = datetime.utcnow() - timedelta(days=days)
+    pid_row = db.execute(
+        sa_text("SELECT id FROM portfolios WHERE index_id = :iid AND is_active = TRUE LIMIT 1"),
+        {"iid": index_id}
+    ).fetchone()
+    if not pid_row:
+        return 0.0
+    pid = pid_row[0]
+    snaps = db.query(PortfolioSnapshot).filter(
+        PortfolioSnapshot.portfolio_id == pid,
+        PortfolioSnapshot.snapshot_at >= cutoff,
+        PortfolioSnapshot.nav_per_token != None,
+        PortfolioSnapshot.nav_per_token > 0,
+    ).order_by(PortfolioSnapshot.snapshot_at.asc()).all()
+    if len(snaps) < 2:
+        return 0.0
+    first_nav = snaps[0].nav_per_token
+    last_nav = snaps[-1].nav_per_token
+    return round((last_nav - first_nav) / first_nav * 100, 2) if first_nav > 0 else 0.0
+
 def _filter_constituents(idx, network_mode: str) -> list:
-    return [
-        ConstituentOut.model_validate(c)
-        for c in idx.constituents
-        if c.network_mode == network_mode
-    ]
+    seen = set()
+    result = []
+    for c in idx.constituents:
+        if c.network_mode != network_mode:
+            continue
+        if not getattr(c, "in_basket", True):
+            continue
+        if c.symbol in seen:
+            continue
+        seen.add(c.symbol)
+        result.append(ConstituentOut.model_validate(c))
+    return result
 
 
 @router.get("", response_model=ApiResponse)
@@ -27,8 +59,12 @@ def list_indexes(network_mode: str = Query("mainnet"), db: Session = Depends(get
             SubscriberPortfolio.index_id == idx.id,
             SubscriberPortfolio.network_mode == network_mode,
         ).scalar() or 0.0
+        r60d = _calc_period_return(db, idx.id, 60)
+        r90d = _calc_period_return(db, idx.id, 90)
         idx_out = IndexOut.model_validate(idx).model_copy(update={
             "aum_usd": round(aum, 2),
+            "return_60d_pct": r60d,
+            "return_90d_pct": r90d,
             "constituents": _filter_constituents(idx, network_mode),
         })
         results.append(idx_out)

@@ -368,16 +368,20 @@ async def admin_trades(network_mode: str = "mainnet", limit: int = 50, db: Sessi
                 "quantity":        r.quantity,
                 "price":           r.price_usd,
                 "usd_value":       round(r.notional_usd, 2),
+                "fee_usd":         round(getattr(r, "fee_usd", 0) or 0, 6),
+                "fee_pct":         getattr(r, "fee_pct", 0.001) or 0.001,
+                "fee_reason":      getattr(r, "fee_reason", "") or "",
                 "status":          r.status,
                 "skip_reason":     r.skip_reason,
                 "source":          r.source,
+                "proposal_id":     r.proposal_id,
                 "index_id":        r.index_id,
                 "order_id":        r.order_id,
                 "timestamp":       r.executed_at.isoformat() if r.executed_at else "",
                 "is_simulated":    False,
                 "investor_wallet": wallet,
             })
-        return {"data": trades, "count": len(trades)}
+        return {"data": trades, "count": len(trades), "total_fees_usd": round(sum(t["fee_usd"] for t in trades), 6)}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -895,3 +899,141 @@ async def admin_alerts(db: Session = Depends(get_db), _: None = Depends(require_
         "healthy": all(a["severity"] != "critical" for a in alerts),
         "checked_at": now.isoformat() + "Z",
     }
+
+
+# ── Fee Management Endpoints ──────────────────────────────────────────────────
+
+@router.get("/fees/summary")
+async def fees_summary(
+    _: None = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Resumo de taxas coletadas e pendentes."""
+    import json as _json
+
+    collected = (
+        db.query(AgentActivityLog)
+        .filter(AgentActivityLog.agent == "fee_manager")
+        .order_by(AgentActivityLog.timestamp.desc())
+        .all()
+    )
+
+    total_mgmt = 0.0
+    total_perf = 0.0
+    history = []
+    for log in collected:
+        data = {}
+        if log.data:
+            try:
+                data = log.data if isinstance(log.data, dict) else _json.loads(log.data)
+            except Exception:
+                pass
+        fee_val = data.get("fee_amount_usd", 0.0) or 0.0
+        fee_type = data.get("type", "")
+        if "management" in log.action:
+            total_mgmt += fee_val
+        elif "performance" in log.action:
+            total_perf += fee_val
+        history.append({
+            "id": log.id,
+            "action": log.action,
+            "type": fee_type,
+            "fee_amount_usd": fee_val,
+            "index_id": log.index_id,
+            "index_name": data.get("index_name", log.index_id),
+            "timestamp": log.timestamp.isoformat() if log.timestamp else None,
+            "description": log.description,
+        })
+
+    from services.fee_manager import _monthly_mgmt_rate, PERFORMANCE_FEE_PCT
+    pending_mgmt = []
+    pending_perf = []
+
+    indexes = db.query(AlphaIndex).filter(AlphaIndex.is_active == True).all()
+    monthly_rate = _monthly_mgmt_rate()
+    for idx in indexes:
+        aum = idx.aum_usd or 0.0
+        if aum > 0:
+            pending_mgmt.append({
+                "index_id": idx.id,
+                "index_name": idx.name,
+                "aum_usd": aum,
+                "fee_amount_usd": round(aum * monthly_rate, 4),
+            })
+
+    portfolios = db.query(SubscriberPortfolio).all()
+    for p in portfolios:
+        hwm = p.high_water_mark_usd or p.deposited_usd or 0.0
+        current = p.current_value_usd or 0.0
+        if current > hwm:
+            gain = current - hwm
+            fee = round(gain * (PERFORMANCE_FEE_PCT / 100.0), 4)
+            if fee >= 0.01:
+                idx = next((i for i in indexes if i.id == p.index_id), None)
+                pending_perf.append({
+                    "portfolio_id": p.id,
+                    "index_name": idx.name if idx else p.index_id,
+                    "current_value_usd": current,
+                    "high_water_mark_usd": hwm,
+                    "gain_above_hwm": round(gain, 4),
+                    "fee_amount_usd": fee,
+                })
+
+    return {
+        "collected": {
+            "management_total_usd": round(total_mgmt, 4),
+            "performance_total_usd": round(total_perf, 4),
+            "grand_total_usd": round(total_mgmt + total_perf, 4),
+            "count": len(collected),
+            "history": history,
+        },
+        "pending": {
+            "management": pending_mgmt,
+            "management_total_usd": round(sum(p["fee_amount_usd"] for p in pending_mgmt), 4),
+            "performance": pending_perf,
+            "performance_total_usd": round(sum(p["fee_amount_usd"] for p in pending_perf), 4),
+        },
+        "config": {
+            "management_fee_annual_pct": 2.0,
+            "management_fee_monthly_pct": round(monthly_rate * 100, 4),
+            "performance_fee_pct": PERFORMANCE_FEE_PCT,
+            "collection_schedule": "Dia 1 de cada mês às 08:00 UTC",
+        },
+    }
+
+
+@router.post("/fees/collect")
+async def fees_collect(
+    dry_run: bool = True,
+    _: None = Depends(require_admin),
+):
+    """Dispara cobrança de fees manualmente. dry_run=true para simulação."""
+    from services.fee_manager import run_monthly_fees
+    result = await run_monthly_fees(dry_run=dry_run)
+    return result
+
+
+@router.get("/fees/history")
+async def fees_history(
+    limit: int = 50,
+    _: None = Depends(require_admin),
+    db: Session = Depends(get_db),
+):
+    """Histórico completo de cobranças de taxas."""
+    logs = (
+        db.query(AgentActivityLog)
+        .filter(AgentActivityLog.agent == "fee_manager")
+        .order_by(AgentActivityLog.timestamp.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "id": l.id,
+            "action": l.action,
+            "description": l.description,
+            "timestamp": l.timestamp.isoformat() if l.timestamp else None,
+            "data": l.data,
+        }
+        for l in logs
+    ]
